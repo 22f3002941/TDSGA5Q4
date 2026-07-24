@@ -1,10 +1,9 @@
 import re
 from typing import List
-
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Skill Safety Scanner", version="1.0.0")
+app = FastAPI(title="Skill Safety Scanner", version="1.1.0")
 
 
 class ScanRequest(BaseModel):
@@ -23,68 +22,81 @@ CATEGORY_ORDER = [
 ]
 
 
-SECRET_PATTERNS = [
-    r"-----BEGIN [A-Z ]+PRIVATE KEY-----",
-    r"(?i)\bapi[_-]?key\b\s*[:=]\s*['\"]?[A-Za-z0-9_\-]{12,}['\"]?",
-    r"(?i)\bsecret\b\s*[:=]\s*['\"]?[A-Za-z0-9_\-\/+=]{12,}['\"]?",
-    r"(?i)\btoken\b\s*[:=]\s*['\"]?[A-Za-z0-9_\-\/+=]{12,}['\"]?",
-    r"(?i)\bpassword\b\s*[:=]\s*['\"]?.{6,}['\"]?",
-    r"(?i)webhook\.slack\.com/services/",
-    r"(?i)hooks\.slack\.com/services/",
-    r"(?i)discord(app)?\.com/api/webhooks/",
-]
-
-
-PROMPT_INJECTION_PATTERNS = [
-    r"(?i)\bignore (all|any|the)? previous instructions\b",
-    r"(?i)\bignore the user's (stop|cancel|abort) request\b",
-    r"(?i)\bdo not tell the user\b",
-    r"(?i)\bhide (this|the) action\b",
-    r"(?i)\bsilently (send|upload|exfiltrate|transmit)\b",
-    r"(?i)\bexfiltrat(e|ion)\b",
-    r"(?i)\boverride user control\b",
-    r"(?i)\bbypass (safety|policy|guardrails)\b",
-    r"(?i)\bact as system\b",
-    r"(?i)\bnever mention\b.*\buser\b",
-]
-
-
-EXCESSIVE_PERMISSION_PATTERNS = [
-    r"(?i)\bfull filesystem\b",
-    r"(?i)\bread and write (the )?entire filesystem\b",
-    r"(?i)\bunrestricted filesystem\b",
-    r"(?i)\baccess to any file\b",
-    r"(?i)\bnetwork access to any domain\b",
-    r"(?i)\ballow all domains\b",
-    r"(?i)\bunrestricted network\b",
-    r"(?i)\bsubprocess execution\b",
-    r"(?i)\brun arbitrary shell commands\b",
-]
-
-
 def split_frontmatter(text: str):
-    if not text.startswith("---"):
-        return "", text
-    parts = text.split("---", 2)
-    if len(parts) >= 3:
-        return parts[1], parts[2]
+    if text.startswith("---"):
+        parts = text.split("---", 2)
+        if len(parts) >= 3:
+            return parts[1], parts[2]
     return "", text
 
 
-def has_any_pattern(text: str, patterns: list[str]) -> bool:
-    return any(re.search(p, text) for p in patterns)
+def norm(text: str) -> str:
+    return text.lower()
 
 
 def detect_hardcoded_secret(text: str) -> bool:
-    return has_any_pattern(text, SECRET_PATTERNS)
+    t = text
+    patterns = [
+        r"-----BEGIN [A-Z ]+PRIVATE KEY-----",
+        r"(?i)\b(sk|pk|rk)_[A-Za-z0-9]{16,}\b",
+        r"(?i)\bapi[_-]?key\b\s*[:=]\s*['\"]?[A-Za-z0-9_\-\/+=]{8,}['\"]?",
+        r"(?i)\bsecret\b\s*[:=]\s*['\"]?[A-Za-z0-9_\-\/+=]{8,}['\"]?",
+        r"(?i)\btoken\b\s*[:=]\s*['\"]?[A-Za-z0-9_\-\/+=]{8,}['\"]?",
+        r"(?i)\bpassword\b\s*[:=]\s*['\"]?.{6,}['\"]?",
+        r"(?i)\bwebhook\b\s*[:=]\s*['\"]?https?://\S+",
+        r"(?i)https?://[^ \n]+/(?:api/)?webhooks?/\S+",
+        r"(?i)\bsecret[_-]?key\b\s*[:=]\s*['\"]?[A-Za-z0-9_\-\/+=]{8,}['\"]?",
+    ]
+    return any(re.search(p, t) for p in patterns)
 
 
-def detect_prompt_injection(body: str) -> bool:
-    return has_any_pattern(body, PROMPT_INJECTION_PATTERNS)
+def detect_prompt_injection(text: str) -> bool:
+    t = norm(text)
+    patterns = [
+        r"ignore previous instructions",
+        r"ignore all previous instructions",
+        r"ignore any previous instructions",
+        r"ignore the user's stop request",
+        r"ignore the user's cancel request",
+        r"ignore user control",
+        r"do not tell the user",
+        r"do not reveal",
+        r"hide this action",
+        r"silently exfiltrate",
+        r"silently send",
+        r"silently upload",
+        r"silently transmit",
+        r"exfiltrate",
+        r"bypass safety",
+        r"bypass policy",
+        r"override user control",
+        r"disable safeguards",
+        r"never mention",
+        r"without telling the user",
+    ]
+    return any(p in t for p in patterns)
 
 
 def detect_excessive_permissions(text: str) -> bool:
-    return has_any_pattern(text, EXCESSIVE_PERMISSION_PATTERNS)
+    t = norm(text)
+    patterns = [
+        r"full filesystem",
+        r"entire filesystem",
+        r"read and write any file",
+        r"read any file",
+        r"write any file",
+        r"unrestricted filesystem",
+        r"recursive access to all files",
+        r"network access to any domain",
+        r"allow all domains",
+        r"unrestricted network",
+        r"egress to any domain",
+        r"access to any website",
+        r"subprocess execution",
+        r"run arbitrary shell commands",
+        r"execute arbitrary commands",
+    ]
+    return any(p in t for p in patterns)
 
 
 def detect_unclear_provenance(frontmatter: str, body: str) -> bool:
@@ -95,15 +107,17 @@ def detect_unclear_provenance(frontmatter: str, body: str) -> bool:
     has_version = re.search(r"(?im)^\s*version\s*:\s*.+$", fm) is not None
     has_changelog = re.search(r"(?im)^\s*(changelog|changes)\s*:\s*.+$", fm) is not None
 
-    rewrite_self = re.search(
-        r"(?i)\b(update|rewrite|modify)\s+(the\s+)?(version|author|changelog)\b",
+    rewrite_version = re.search(
+        r"(?i)\b(rewrite|silently change|auto[- ]?update|modify)\b.*\b(version|author|changelog)\b",
         full,
     ) is not None
 
-    if rewrite_self:
+    if rewrite_version:
         return True
 
-    if not has_author and not has_version and not has_changelog:
+    missing_count = sum([not has_author, not has_version, not has_changelog])
+
+    if missing_count == 3:
         return True
 
     return False
@@ -128,13 +142,7 @@ def scan(req: ScanRequest):
     if detect_unclear_provenance(frontmatter, body):
         categories.append("unclear_provenance")
 
-    seen = set()
-    ordered = []
-    for c in CATEGORY_ORDER:
-        if c in categories and c not in seen:
-            ordered.append(c)
-            seen.add(c)
-
+    ordered = [c for c in CATEGORY_ORDER if c in categories]
     return {"categories": ordered}
 
 
